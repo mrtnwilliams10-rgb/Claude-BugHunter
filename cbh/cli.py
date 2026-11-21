@@ -268,15 +268,35 @@ def recon_http_probe(host: str) -> dict | None:
         m = re.search(r"<title[^>]*>([^<]*)</title>", body[:8192], re.I)
         if m:
             title = m.group(1).strip()[:80]
+        server = headers.get("server", "")
+        waf, blocked = _detect_waf_block(code, server, title, body)
         return {
             "url": url,
             "code": code,
-            "server": headers.get("server", ""),
+            "server": server,
             "title": title,
             "powered_by": headers.get("x-powered-by", ""),
             "drupal_cache": headers.get("x-drupal-cache", ""),
+            "waf": waf,            # fronting WAF/CDN, if named by the Server header
+            "blocked": blocked,    # True = we got a challenge/interstitial, not the real app
         }
     return None
+
+
+# Markers for Cloudflare's bot-management interstitial. A 403/503 that is really a
+# challenge page must not be read as live app surface — the recon saw a wall.
+_CF_CHALLENGE_MARKERS = ("attention required", "just a moment", "cf-chl",
+                         "challenge-platform", "cf-browser-verification")
+
+
+def _detect_waf_block(code: int, server: str, title: str, body: str) -> tuple[str, bool]:
+    srv = (server or "").lower()
+    waf = "cloudflare" if "cloudflare" in srv else ""
+    hay = f"{title or ''} {body[:4096] if body else ''}".lower()
+    is_cf = waf == "cloudflare" or "cf-ray" in hay
+    blocked = bool(is_cf and code in (403, 503)
+                   and any(mark in hay for mark in _CF_CHALLENGE_MARKERS))
+    return waf, blocked
 
 
 def configure_proxy_from_args(args: argparse.Namespace) -> None:
@@ -443,16 +463,86 @@ PRODUCER = "cbh-recon/2.1.0"
 _P1_HINTS = ("api.", "api-", "graphql", "auth.", "sso.", "login.", "account.",
              "admin.", "internal.", "intranet.", "staging.", "stage.", "dev.",
              "test.", "uat.", "qa.", "gateway.", "gw.", "vpn.", "portal.")
-_KILL_HINTS = ("cdn.", "static.", "assets.", "img.", "images.", "media.", "fonts.")
+# CDN/static hosts keyed on the first DNS label. `cdn` is a prefix match so
+# `cdne`/`cdnl`/`cdn1` don't slip past (the old `startswith("cdn.")` missed them);
+# the rest are exact first-label names.
+_CDN_PREFIXES = ("cdn",)
+_CDN_LABELS = frozenset({"static", "assets", "img", "images", "media", "fonts"})
+# Tracking/analytics plumbing. Method-sensitive (405), but low yield — a pixel that
+# only takes POST is still a pixel, so it must NOT ride the 405→P1 bump and flood P1.
+_TRACKING_LABELS = frozenset({"trk", "pxl", "px", "pixel", "beacon", "stat", "stats"})
+_TRACKING_SUBSTR = ("analytics", "telemetry")
+
+
+def _asset_signals(host: str, rec: dict | None) -> dict:
+    """Read the probe record into the booleans the ranker reasons over. A ranking
+    that ignores the probe (as this one did) can't tell a live API from a WAF wall."""
+    h = host.lower()
+    first = h.split(".", 1)[0]
+    rec = rec or {}
+    code = rec.get("code")
+    server = (rec.get("server") or "").lower()
+    blocked = bool(rec.get("blocked"))
+    return {
+        "host": h,
+        "code": code,
+        "server": server,
+        "blocked": blocked,                                  # WAF/bot interstitial, not real app
+        "websocket": ("websocket" in h or first in ("ws", "wss") or first.startswith("ws-")),
+        "method_sensitive": code == 405,                     # 405 on GET / = method-gated endpoint
+        "server_masked": server == "" and code not in (None, 0) and not blocked,
+        "cdn": first.startswith(_CDN_PREFIXES) or first in _CDN_LABELS,
+        "tracking": first in _TRACKING_LABELS or any(t in h for t in _TRACKING_SUBSTR),
+    }
+
+
+def _rank_asset(host: str, rec: dict | None = None) -> tuple[str, str]:
+    """Priority + rationale from hostname keywords AND probe evidence. Evidence of
+    a real backend (websocket origin, 405 method-gating) outranks a hostname guess;
+    a Cloudflare challenge is annotated — it means recon went blind, not low value."""
+    s = _asset_signals(host, rec)
+    h = s["host"]
+
+    if s["websocket"]:
+        prio, why = "P1", "realtime/websocket origin"
+    elif s["tracking"]:
+        # Low yield even when method-gated — demoted before the 405 bump and the
+        # hostname hints (so account-linked trackers like trk.account don't reach P1).
+        prio, why = "P2", "tracking/analytics plumbing — low yield"
+    elif s["method_sensitive"]:
+        prio, why = "P1", "method-sensitive endpoint (405 on GET) — API/realtime backend"
+    elif any(k in h for k in _P1_HINTS):
+        prio, why = "P1", "high-value surface (api/auth/admin/non-prod)"
+    elif s["cdn"]:
+        prio, why = "KILL", "static/CDN host — low yield"
+    else:
+        prio, why = "P2", "standard web surface"
+
+    notes = []
+    if s["blocked"]:
+        notes.append("cloudflare-challenged — automated recon blind, needs browser pass")
+    if s["server_masked"] and prio != "KILL":
+        notes.append("server header stripped")
+    if notes:
+        why = f"{why}  ·  {'; '.join(notes)}"
+    return prio, why
+
+
+def _evidence_bug_classes(host: str, rec: dict | None) -> list[str]:
+    """Bug classes the probe implies even when the root URL carries no keyword — the
+    homepage-only `classify_url` can't see that a 405/websocket host is an API."""
+    s = _asset_signals(host, rec)
+    classes = set()
+    if s["websocket"]:
+        classes.add("hunt-websocket")
+    if s["method_sensitive"]:
+        classes.add("hunt-api-misconfig")
+    return sorted(classes)
 
 
 def _rank_host(host: str) -> tuple[str, str]:
-    h = host.lower()
-    if any(k in h for k in _P1_HINTS):
-        return "P1", "high-value surface (api/auth/admin/non-prod)"
-    if any(h.startswith(k) for k in _KILL_HINTS):
-        return "KILL", "static/CDN host — low yield"
-    return "P2", "standard web surface"
+    """Back-compat hostname-only entrypoint (no probe record)."""
+    return _rank_asset(host, None)
 
 
 def build_manifest(target: str, subs: set, resolved: dict, live: list) -> dict:
@@ -478,8 +568,9 @@ def build_manifest(target: str, subs: set, resolved: dict, live: list) -> dict:
     ranked = []
     for host in sorted(live_by_host):
         r = live_by_host[host]
-        prio, why = _rank_host(host)
-        bug_classes = sorted(classify_url(r["url"])["matches"].keys()) if r.get("url") else []
+        prio, why = _rank_asset(host, r)
+        url_classes = sorted(classify_url(r["url"])["matches"].keys()) if r.get("url") else []
+        bug_classes = sorted(set(url_classes) | set(_evidence_bug_classes(host, r)))
         ranked.append({"url": r.get("url"), "host": host, "bug_classes": bug_classes,
                        "priority": prio, "rationale": why})
     _order = {"P1": 0, "P2": 1, "KILL": 2}
